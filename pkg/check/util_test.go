@@ -4,31 +4,43 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/openshift/vsphere-problem-detector/pkg/cache"
-	"github.com/openshift/vsphere-problem-detector/pkg/testlib"
-	"gopkg.in/gcfg.v1"
-
 	ocpv1 "github.com/openshift/api/config/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/legacy-cloud-providers/vsphere"
+
+	"github.com/openshift/vsphere-problem-detector/pkg/cache"
+	"github.com/openshift/vsphere-problem-detector/pkg/testlib"
 )
 
 func SetupSimulator(kubeClient *testlib.FakeKubeClient, modelDir string) (ctx *CheckContext, cleanup func(), err error) {
-	setup, cleanup, err := testlib.SetupSimulator(kubeClient, modelDir)
+	return SetupSimulatorWithConfig(kubeClient, modelDir, "")
+}
+
+func SetupSimulatorWithConfig(kubeClient *testlib.FakeKubeClient, modelDir, configFileName string) (ctx *CheckContext, cleanup func(), err error) {
+	setup, cleanup, err := testlib.SetupSimulatorWithConfig(kubeClient, modelDir, configFileName)
+
+	vcMap := make(map[string]*VCenter)
+
+	for vCenterName := range setup.VMConfig.Config.VirtualCenter {
+		vc := VCenter{
+			VCenterName: vCenterName,
+			TagManager:  setup.VCenters[vCenterName].TagManager,
+			VMClient:    setup.VCenters[vCenterName].VMClient,
+			Cache:       cache.NewCheckCache(setup.VCenters[vCenterName].VMClient),
+			Username:    setup.VCenters[vCenterName].Username,
+		}
+		vcMap[vCenterName] = &vc
+	}
 
 	ctx = &CheckContext{
 		Context:     setup.Context,
 		VMConfig:    setup.VMConfig,
-		TagManager:  setup.TagManager,
 		ClusterInfo: setup.ClusterInfo,
-		VMClient:    setup.VMClient,
-		Cache:       cache.NewCheckCache(setup.VMClient),
 		KubeClient:  kubeClient,
+		VCenters:    vcMap,
 	}
 
-	ctx.Username = setup.Username
 	if kubeClient != nil && kubeClient.Infrastructure != nil {
 		ConvertToPlatformSpec(kubeClient.Infrastructure, ctx)
 	}
@@ -38,27 +50,41 @@ func SetupSimulator(kubeClient *testlib.FakeKubeClient, modelDir string) (ctx *C
 func TestDatastoreByURL(t *testing.T) {
 	tests := []struct {
 		name         string
+		cloudConfig  string
 		infra        *ocpv1.Infrastructure
 		dataStoreURL string
 		expectError  bool
 	}{
 		{
-			name:         "with single failure-domain and valid datastore url",
+			name:         "with no failure-domain but with valid datastore url",
 			infra:        testlib.Infrastructure(),
+			dataStoreURL: "testdata/default/govcsim-DC0-LocalDS_3-206027153",
+			expectError:  false,
+		},
+		{
+			name:         "with no failure-domain defined but with not-valid datastore url",
+			dataStoreURL: "testdata/default/govcsim-DC0-LocalDS_100-206027153",
+			infra:        testlib.Infrastructure(),
+			expectError:  true,
+		},
+		{
+			name:         "with single failure-domain and valid datastore url",
+			infra:        testlib.InfrastructureWithFailureDomain(),
 			dataStoreURL: "testdata/default/govcsim-DC0-LocalDS_3-206027153",
 			expectError:  false,
 		},
 		{
 			name:         "with single failure-domain and not-valid datastore url",
 			dataStoreURL: "testdata/default/govcsim-DC0-LocalDS_100-206027153",
-			infra:        testlib.Infrastructure(),
+			infra:        testlib.InfrastructureWithFailureDomain(),
 			expectError:  true,
 		},
 		{
 			name: "with multiple failure-domain and only one having valid datastore url",
-			infra: testlib.Infrastructure(func(infra *ocpv1.Infrastructure) {
+			infra: testlib.InfrastructureWithFailureDomain(func(infra *ocpv1.Infrastructure) {
 				infra.Spec.PlatformSpec.VSphere.FailureDomains = append(infra.Spec.PlatformSpec.VSphere.FailureDomains, ocpv1.VSpherePlatformFailureDomainSpec{
-					Name: "other one",
+					Name:   "other one",
+					Server: "dc0",
 					Topology: ocpv1.VSpherePlatformTopology{
 						Datacenter: "DC1",
 						Datastore:  "local-ds1000",
@@ -70,15 +96,37 @@ func TestDatastoreByURL(t *testing.T) {
 		},
 		{
 			name: "with multiple failure-domain and none having valid datastore",
-			infra: testlib.Infrastructure(func(infra *ocpv1.Infrastructure) {
+			infra: testlib.InfrastructureWithFailureDomain(func(infra *ocpv1.Infrastructure) {
 				infra.Spec.PlatformSpec.VSphere.FailureDomains = append(infra.Spec.PlatformSpec.VSphere.FailureDomains, ocpv1.VSpherePlatformFailureDomainSpec{
-					Name: "other one",
+					Name:   "other one",
+					Server: "dc0",
 					Topology: ocpv1.VSpherePlatformTopology{
 						Datacenter: "DC1",
 						Datastore:  "local-ds1000",
 					},
 				})
 			}),
+			dataStoreURL: "testdata/default/govcsim-DC0-LocalDS_100-206027153",
+			expectError:  true,
+		},
+		{
+			name:         "with multiple vCenters and first having valid datastore url",
+			cloudConfig:  "simple_config.yaml",
+			infra:        testlib.InfrastructureWithMultiVCenters(),
+			dataStoreURL: "testdata/default/govcsim-DC0-LocalDS_3-206027153",
+			expectError:  false,
+		},
+		{
+			name:         "with multiple vCenters and second having valid datastore url",
+			cloudConfig:  "simple_config.yaml",
+			infra:        testlib.InfrastructureWithMultiVCenters(),
+			dataStoreURL: "testdata/default/govcsim-DC1-LocalDS_1-057538539",
+			expectError:  false,
+		},
+		{
+			name:         "with multiple vCenters and none having valid datastore",
+			cloudConfig:  "simple_config.yaml",
+			infra:        testlib.InfrastructureWithMultiVCenters(),
 			dataStoreURL: "testdata/default/govcsim-DC0-LocalDS_100-206027153",
 			expectError:  true,
 		},
@@ -91,13 +139,13 @@ func TestDatastoreByURL(t *testing.T) {
 				Infrastructure: test.infra,
 				Nodes:          testlib.DefaultNodes(),
 			}
-			ctx, cleanup, err := SetupSimulator(kubeClient, testlib.DefaultModel)
+			ctx, cleanup, err := SetupSimulatorWithConfig(kubeClient, testlib.DefaultModel, test.cloudConfig)
 			if err != nil {
 				t.Fatalf("unexpected error setting up simulator: %v", err)
 			}
 			defer cleanup()
 
-			_, _, err = getDatastoreByURL(ctx, test.dataStoreURL)
+			_, _, _, err = getDatastoreByURL(ctx, test.dataStoreURL)
 			if !test.expectError && err != nil {
 				t.Errorf("unexpected error finding datastore: %v", err)
 			}
@@ -111,71 +159,32 @@ func TestDatastoreByURL(t *testing.T) {
 
 func TestMissingFailureDomains(t *testing.T) {
 	ocpv1.Install(scheme.Scheme)
-	config := prolematicConfig(t)
 	infra := getProblemInfra()
 
 	kubeClient := &testlib.FakeKubeClient{
 		Infrastructure: infra,
 		Nodes:          testlib.DefaultNodes(),
 	}
-	setup, cleanup, err := testlib.SetupSimulator(kubeClient, testlib.DefaultModel)
+	ctx, cleanup, err := SetupSimulatorWithConfig(kubeClient, testlib.DefaultModel, "problematic_config.ini")
 	if err != nil {
 		t.Errorf("Error setting up simulator: %v", err)
 	}
 	defer cleanup()
 
-	ctx := &CheckContext{
-		Context:     setup.Context,
-		VMConfig:    config,
-		TagManager:  setup.TagManager,
-		ClusterInfo: setup.ClusterInfo,
-		VMClient:    setup.VMClient,
-		Cache:       cache.NewCheckCache(setup.VMClient),
-		KubeClient:  kubeClient,
-	}
-
-	ctx.Username = setup.Username
-
-	ConvertToPlatformSpec(infra, ctx)
 	if len(ctx.PlatformSpec.FailureDomains) == 0 {
 		t.Errorf("FailureDomains should not be empty")
 	}
 
 	failureDomain := ctx.PlatformSpec.FailureDomains[0]
 	topology := failureDomain.Topology
-	if topology.Datacenter != config.Workspace.Datacenter {
-		t.Errorf("Datacenter in topology should be %s, got %s", config.Workspace.Datacenter, topology.Datacenter)
+	config := ctx.VMConfig
+	if topology.Datacenter != config.LegacyConfig.Workspace.Datacenter {
+		t.Errorf("Datacenter in topology should be %s, got %s", config.LegacyConfig.Workspace.Datacenter, topology.Datacenter)
 	}
 
-	if topology.Datastore != config.Workspace.DefaultDatastore {
-		t.Errorf("Datastore in topology should be %s, got %s", config.Workspace.DefaultDatastore, topology.Datastore)
+	if topology.Datastore != config.LegacyConfig.Workspace.DefaultDatastore {
+		t.Errorf("Datastore in topology should be %s, got %s", config.LegacyConfig.Workspace.DefaultDatastore, topology.Datastore)
 	}
-}
-
-func prolematicConfig(t *testing.T) *vsphere.VSphereConfig {
-	data := `
-	[Global]
-	secret-name=vsphere-creds
-	secret-namespace=kube-system
-	insecure-flag=1
-
-
-    [Workspace]
-    server=foobar.com
-    datacenter=dc443
-    default-datastore=/foobar/datastore
-    folder=/foobar/folder
-
-    [VirtualCenter "foobar.com"]
-    datacenters=dc443
-	`
-	var cfg vsphere.VSphereConfig
-	err := gcfg.ReadStringInto(&cfg, data)
-	if err != nil {
-		t.Errorf("Error reading config: %v", err)
-		return nil
-	}
-	return &cfg
 }
 
 func convertYAMLToObject(yamlString string) (runtime.Object, error) {
