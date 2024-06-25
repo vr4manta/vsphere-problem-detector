@@ -177,7 +177,7 @@ func checkStoragePolicy(ctx *CheckContext, policyName string, infrastructure *co
 	for _, vCenter := range ctx.VCenters {
 		pbm, err := getPolicy(ctx, vCenter, policyName)
 		if err != nil {
-			return err
+			return fmt.Errorf("error listing storage policy: %s", err)
 		}
 		if len(pbm) == 0 {
 			return fmt.Errorf("error listing storage policy %s: policy not found", policyName)
@@ -358,12 +358,12 @@ func checkDataStoreWithURL(ctx *CheckContext, dsURL string, dsTypes dataStoreTyp
 func checkForDatastoreCluster(ctx *CheckContext, vCenter *VCenter, dsMo mo.Datastore, dataStoreName, dcName string, dsTypes dataStoreTypeCollector) error {
 	// Collect DS type
 	dsType := dsMo.Summary.Type
-	klog.V(4).Infof("Datastore %s is of type %s", dataStoreName, dsType)
+	klog.V(4).Infof("Datastore %s/%s is of type %s", vCenter.VCenterName, dataStoreName, dsType)
 	dsTypes.addDataStore(dataStoreName, dsType)
 
 	content, err := vCenter.Cache.GetStoragePods(ctx.Context)
 	if err != nil {
-		return err
+		return fmt.Errorf("unable to get storage pods for vcenter %s: %v", vCenter.VCenterName, err)
 	}
 	for _, ds := range content {
 		for _, child := range ds.Folder.ChildEntity {
